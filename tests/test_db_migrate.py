@@ -1,0 +1,278 @@
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from db_migrate import (
+    MigrationError,
+    create_migration,
+    discover_migrations,
+    ensure_schema_and_table,
+    get_applied_versions,
+    normalize_database_url,
+    parse_migration,
+    run_migrate,
+    run_rollback,
+    run_status,
+    validate_schema_name,
+)
+
+# --- Pure function tests ---
+
+
+class TestValidateSchemaName:
+    def test_accepts_valid_identifiers(self) -> None:
+        for name in ("public", "my_schema", "_private", "Schema1"):
+            validate_schema_name(name)
+
+    def test_rejects_invalid_identifiers(self) -> None:
+        for name in ("", "1start", "has space", "semi;colon", "my-schema", "a.b", 'a"b'):
+            with pytest.raises(MigrationError):
+                validate_schema_name(name)
+
+
+class TestParseMigration:
+    def test_extracts_up_block(self) -> None:
+        content = "-- migrate:up\nCREATE TABLE t (id INT);\n\n-- migrate:down\nDROP TABLE t;\n"
+        assert parse_migration(content, "up") == "CREATE TABLE t (id INT);"
+
+    def test_extracts_down_block(self) -> None:
+        content = "-- migrate:up\nCREATE TABLE t (id INT);\n\n-- migrate:down\nDROP TABLE t;\n"
+        assert parse_migration(content, "down") == "DROP TABLE t;"
+
+    def test_returns_none_for_missing_block(self) -> None:
+        content = "-- migrate:up\nCREATE TABLE t (id INT);\n"
+        assert parse_migration(content, "down") is None
+
+    def test_returns_none_for_empty_block(self) -> None:
+        content = "-- migrate:up\n\n-- migrate:down\n"
+        assert parse_migration(content, "up") is None
+
+    def test_handles_multiline_sql(self) -> None:
+        content = (
+            "-- migrate:up\nCREATE TABLE t (\n  id INT,\n  name TEXT\n);\n\n-- migrate:down\nDROP TABLE t;\n"
+        )
+        result = parse_migration(content, "up")
+        assert result is not None
+        assert "id INT" in result
+        assert "name TEXT" in result
+
+
+class TestNormalizeDatabaseUrl:
+    def test_strips_asyncpg_driver(self) -> None:
+        url = "postgresql+asyncpg://user:pass@localhost/db"
+        assert normalize_database_url(url) == "postgresql://user:pass@localhost/db"
+
+    def test_leaves_plain_url_unchanged(self) -> None:
+        url = "postgresql://user:pass@localhost/db"
+        assert normalize_database_url(url) == url
+
+
+class TestDiscoverMigrations:
+    def test_returns_sorted_migrations(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260102000000_second.sql").write_text("-- migrate:up\n")
+        (tmp_migrations_dir / "20260101000000_first.sql").write_text("-- migrate:up\n")
+        result = discover_migrations(tmp_migrations_dir)
+        assert len(result) == 2
+        assert result[0][0] == "20260101000000"
+        assert result[1][0] == "20260102000000"
+
+    def test_skips_invalid_filenames(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_valid.sql").write_text("-- migrate:up\n")
+        (tmp_migrations_dir / "bad_name.sql").write_text("-- migrate:up\n")
+        result = discover_migrations(tmp_migrations_dir)
+        assert len(result) == 1
+
+    def test_returns_empty_for_missing_dir(self, tmp_path: Path) -> None:
+        assert discover_migrations(tmp_path / "nonexistent") == []
+
+
+class TestCreateMigration:
+    def test_creates_file_with_template(self, tmp_migrations_dir: Path) -> None:
+        path = create_migration(tmp_migrations_dir, "add users table")
+        assert path.exists()
+        content = path.read_text()
+        assert "-- migrate:up" in content
+        assert "-- migrate:down" in content
+
+    def test_filename_has_timestamp_and_slug(self, tmp_migrations_dir: Path) -> None:
+        path = create_migration(tmp_migrations_dir, "Add Users Table!")
+        assert path.name.endswith("_add_users_table.sql")
+        assert len(path.stem.split("_")[0]) == 14
+
+    def test_creates_directory_if_missing(self, tmp_path: Path) -> None:
+        d = tmp_path / "new" / "migrations"
+        path = create_migration(d, "init")
+        assert path.exists()
+        assert d.exists()
+
+
+# --- Async function tests (mocked connection) ---
+
+
+def _mock_conn() -> AsyncMock:
+    """Create a mock asyncpg connection with transaction context manager."""
+    conn = AsyncMock()
+    # asyncpg's transaction() is a regular method returning an async context manager
+    tx = MagicMock()
+    tx.__aenter__ = AsyncMock(return_value=tx)
+    tx.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx)
+    return conn
+
+
+class TestEnsureSchemaAndTable:
+    @pytest.mark.asyncio
+    async def test_creates_schema_when_not_public(self) -> None:
+        conn = _mock_conn()
+        await ensure_schema_and_table(conn, "myapp")
+        calls = [c.args[0] for c in conn.execute.call_args_list]
+        assert any("CREATE SCHEMA IF NOT EXISTS myapp" in c for c in calls)
+        assert any("schema_migrations" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_skips_schema_creation_for_public(self) -> None:
+        conn = _mock_conn()
+        await ensure_schema_and_table(conn, "public")
+        calls = [c.args[0] for c in conn.execute.call_args_list]
+        assert not any("CREATE SCHEMA" in c for c in calls)
+        assert any("schema_migrations" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_schema(self) -> None:
+        conn = _mock_conn()
+        with pytest.raises(MigrationError, match="invalid schema name"):
+            await ensure_schema_and_table(conn, "bad;schema")
+
+
+class TestGetAppliedVersions:
+    @pytest.mark.asyncio
+    async def test_returns_version_set(self) -> None:
+        conn = _mock_conn()
+        conn.fetch.return_value = [{"version": "20260101000000"}, {"version": "20260102000000"}]
+        result = await get_applied_versions(conn, "public")
+        assert result == {"20260101000000", "20260102000000"}
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_set(self) -> None:
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+        result = await get_applied_versions(conn, "public")
+        assert result == set()
+
+
+class TestRunMigrate:
+    @pytest.mark.asyncio
+    async def test_applies_pending_migrations(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_first.sql").write_text(
+            "-- migrate:up\nCREATE TABLE t1 (id INT);\n\n-- migrate:down\nDROP TABLE t1;\n"
+        )
+        (tmp_migrations_dir / "20260102000000_second.sql").write_text(
+            "-- migrate:up\nCREATE TABLE t2 (id INT);\n\n-- migrate:down\nDROP TABLE t2;\n"
+        )
+        conn = _mock_conn()
+        conn.fetch.return_value = [{"version": "20260101000000"}]
+
+        count = await run_migrate(conn, "public", tmp_migrations_dir)
+
+        assert count == 1
+        execute_calls = [str(c) for c in conn.execute.call_args_list]
+        assert any("CREATE TABLE t2" in c for c in execute_calls)
+        assert not any("CREATE TABLE t1" in c for c in execute_calls)
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_nothing_pending(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_first.sql").write_text(
+            "-- migrate:up\nCREATE TABLE t (id INT);\n\n-- migrate:down\nDROP TABLE t;\n"
+        )
+        conn = _mock_conn()
+        conn.fetch.return_value = [{"version": "20260101000000"}]
+
+        count = await run_migrate(conn, "public", tmp_migrations_dir)
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_raises_on_missing_up_block(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_bad.sql").write_text("-- migrate:down\nDROP TABLE t;\n")
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+
+        with pytest.raises(MigrationError, match="migrate:up"):
+            await run_migrate(conn, "public", tmp_migrations_dir)
+
+
+class TestRunRollback:
+    @pytest.mark.asyncio
+    async def test_rolls_back_latest(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_first.sql").write_text(
+            "-- migrate:up\nCREATE TABLE t (id INT);\n\n-- migrate:down\nDROP TABLE t;\n"
+        )
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+        conn.fetchrow.return_value = {"version": "20260101000000"}
+
+        result = await run_rollback(conn, "public", tmp_migrations_dir)
+
+        assert result is True
+        execute_calls = [str(c) for c in conn.execute.call_args_list]
+        assert any("DROP TABLE t" in c for c in execute_calls)
+        assert any("DELETE FROM" in c for c in execute_calls)
+
+    @pytest.mark.asyncio
+    async def test_returns_false_when_nothing_applied(self, tmp_migrations_dir: Path) -> None:
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+        conn.fetchrow.return_value = None
+
+        result = await run_rollback(conn, "public", tmp_migrations_dir)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_raises_when_file_missing(self, tmp_migrations_dir: Path) -> None:
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+        conn.fetchrow.return_value = {"version": "20260101000000"}
+
+        with pytest.raises(MigrationError, match="not found on disk"):
+            await run_rollback(conn, "public", tmp_migrations_dir)
+
+    @pytest.mark.asyncio
+    async def test_raises_on_missing_down_block(self, tmp_migrations_dir: Path) -> None:
+        (tmp_migrations_dir / "20260101000000_no_down.sql").write_text(
+            "-- migrate:up\nCREATE TABLE t (id INT);\n"
+        )
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+        conn.fetchrow.return_value = {"version": "20260101000000"}
+
+        with pytest.raises(MigrationError, match="migrate:down"):
+            await run_rollback(conn, "public", tmp_migrations_dir)
+
+
+class TestRunStatus:
+    @pytest.mark.asyncio
+    async def test_prints_status(self, tmp_migrations_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        (tmp_migrations_dir / "20260101000000_first.sql").write_text("-- migrate:up\n")
+        (tmp_migrations_dir / "20260102000000_second.sql").write_text("-- migrate:up\n")
+        conn = _mock_conn()
+        conn.fetch.return_value = [{"version": "20260101000000"}]
+
+        await run_status(conn, "public", tmp_migrations_dir)
+
+        output = capsys.readouterr().out
+        assert "applied" in output
+        assert "pending" in output
+        assert "20260101000000_first.sql" in output
+        assert "20260102000000_second.sql" in output
+
+    @pytest.mark.asyncio
+    async def test_handles_empty_dir(
+        self, tmp_migrations_dir: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        conn = _mock_conn()
+        conn.fetch.return_value = []
+
+        await run_status(conn, "public", tmp_migrations_dir)
+
+        output = capsys.readouterr().out
+        assert "No migration files" in output

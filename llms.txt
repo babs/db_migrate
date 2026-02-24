@@ -1,0 +1,40 @@
+# db_migrate
+
+> Dbmate-style async PostgreSQL migration runner. Single-file tool using asyncpg + structlog.
+
+## What it does
+
+Manages PostgreSQL schema migrations using plain SQL files with `-- migrate:up` and `-- migrate:down` markers. Tracks applied versions in a `schema_migrations` table. Each migration runs in a transaction.
+
+## Commands
+
+- `db_migrate.py` — apply all pending migrations
+- `db_migrate.py --status` — show migration status
+- `db_migrate.py --rollback` — rollback last migration
+- `db_migrate.py --create "description"` — create new migration file
+
+## Migration file format
+
+Filename: `YYYYMMDDHHMMSS_description.sql`
+
+```sql
+-- migrate:up
+CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+
+-- migrate:down
+DROP TABLE users;
+```
+
+## Configuration (env vars)
+
+- `DATABASE_URL` (required) — PostgreSQL connection string
+- `MIGRATIONS_DIR` (default: `db/migrations`) — path to migration files
+- `SCHEMA_NAME` (default: `public`) — schema for tracking table
+
+## Dependencies
+
+asyncpg, structlog, python-dotenv
+
+## Optional: llms-full.txt
+
+For the full source code and API reference, see [llms-full.txt](llms-full.txt).

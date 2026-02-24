@@ -1,0 +1,228 @@
+# db_migrate — Full Reference
+
+> Dbmate-style async PostgreSQL migration runner. Single-file tool using asyncpg + structlog.
+
+## Overview
+
+`db_migrate.py` is a single-file, zero-framework database migration tool for PostgreSQL. It uses asyncpg for async database access, structlog for structured logging, and python-dotenv for configuration.
+
+Designed to be dropped into any Python project that uses PostgreSQL.
+
+## Commands
+
+```bash
+db_migrate.py                          # Apply all pending migrations
+db_migrate.py --status                 # Show migration status
+db_migrate.py --rollback               # Rollback last applied migration
+db_migrate.py --create "description"   # Create new migration file
+db_migrate.py --verbose                # Enable debug logging
+```
+
+## Migration File Format
+
+Files in `db/migrations/` (configurable via `MIGRATIONS_DIR`), named `YYYYMMDDHHMMSS_description.sql`:
+
+```sql
+-- migrate:up
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- migrate:down
+DROP TABLE users;
+```
+
+- `-- migrate:up` block is executed when applying
+- `-- migrate:down` block is executed when rolling back
+- Each migration runs inside a single database transaction
+- Versions are tracked in `{SCHEMA_NAME}.schema_migrations` table
+
+## Configuration
+
+Environment variables (or `.env` file):
+
+| Variable | Default | Required | Description |
+|---|---|---|---|
+| `DATABASE_URL` | — | Yes | PostgreSQL connection string |
+| `MIGRATIONS_DIR` | `db/migrations` | No | Path to SQL migration files |
+| `SCHEMA_NAME` | `public` | No | PostgreSQL schema for tracking table |
+
+SQLAlchemy-style URLs (`postgresql+asyncpg://...`) are automatically normalized to `postgresql://...` for asyncpg compatibility.
+
+## Tracking Table
+
+Created automatically on first run:
+
+```sql
+CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
+    version VARCHAR(14) PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+If `SCHEMA_NAME` is not `public`, the schema is created automatically.
+
+## Error Handling
+
+Library functions raise `MigrationError` on failure — they never call `sys.exit()` directly. Only the CLI entry points (`main()`/`async_main()`) catch `MigrationError` and translate it to exit codes.
+
+## Public API
+
+### Exception
+
+#### `class MigrationError(Exception)`
+Raised when a migration operation fails (missing file, missing SQL block, invalid schema name).
+
+### Validation
+
+#### `validate_schema_name(schema: str) -> None`
+Validate that schema is a safe PostgreSQL identifier (`^[a-zA-Z_][a-zA-Z0-9_]*$`).
+Raises `MigrationError` if invalid.
+
+### Pure functions (no DB, fully testable)
+
+#### `parse_migration(content: str, direction: str = "up") -> str | None`
+Extract SQL block for the given direction (`up` or `down`) from migration file content.
+Returns `None` if the block is missing or empty.
+
+#### `discover_migrations(migrations_dir: Path) -> list[tuple[str, Path]]`
+Scan directory for `.sql` files matching `YYYYMMDDHHMMSS_*.sql`.
+Returns sorted list of `(version, path)` tuples. Skips invalid filenames.
+
+#### `create_migration(migrations_dir: Path, description: str) -> Path`
+Create a new migration file with timestamp prefix and slugified description.
+Returns the created file path. Creates directory if missing.
+
+#### `normalize_database_url(url: str) -> str`
+Strip `+asyncpg` driver suffix from SQLAlchemy-style URLs.
+
+#### `setup_logging(verbose: bool = False) -> None`
+Configure structlog. Auto-detects TTY: console renderer for terminals, JSON for pipes/containers.
+
+### Async functions (require asyncpg connection)
+
+#### `ensure_schema_and_table(conn, schema: str) -> None`
+Create schema (if not `public`) and `schema_migrations` table if they don't exist.
+Raises `MigrationError` if schema name is invalid.
+
+#### `get_applied_versions(conn, schema: str) -> set[str]`
+Return set of version strings that have been applied.
+Raises `MigrationError` if schema name is invalid.
+
+#### `run_migrate(conn, schema: str, migrations_dir: Path) -> int`
+Apply all pending migrations in order. Returns count of migrations applied.
+Raises `MigrationError` if a migration file is missing the `-- migrate:up` block.
+
+#### `run_rollback(conn, schema: str, migrations_dir: Path) -> bool`
+Rollback the most recently applied migration. Returns `True` on success, `False` if nothing to rollback.
+Raises `MigrationError` if migration file is missing or has no `-- migrate:down` block.
+
+#### `run_status(conn, schema: str, migrations_dir: Path) -> None`
+Print a table showing `[applied]` or `[pending]` for each migration file.
+
+## Dependencies
+
+```toml
+[project]
+dependencies = [
+    "asyncpg>=0.30.0",
+    "structlog>=24.0.0",
+    "python-dotenv>=1.0.0",
+]
+```
+
+## Testing
+
+```bash
+uv run pytest -m "not e2e"   # Unit tests (no Docker needed)
+uv run pytest -m e2e          # E2E tests (requires Docker)
+uv run pytest                  # All tests
+```
+
+E2E tests use testcontainers to spin up PostgreSQL automatically.
+
+## Integration Patterns
+
+### Drop into existing project
+
+Copy `db_migrate.py` into your project, add the three dependencies, set `DATABASE_URL`, and configure `MIGRATIONS_DIR` if your migrations aren't in `db/migrations/`.
+
+### Kubernetes Job
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+spec:
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: your-app:latest
+          command: ["python", "db_migrate.py"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+      restartPolicy: OnFailure
+  backoffLimit: 3
+```
+
+### Docker Compose
+
+```yaml
+services:
+  migrate:
+    build: .
+    command: python db_migrate.py
+    environment:
+      DATABASE_URL: postgresql://user:pass@db:5432/mydb
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+### CI/CD Pipeline
+
+```yaml
+migrate:
+  stage: deploy
+  script:
+    - python db_migrate.py --status
+    - python db_migrate.py
+  only:
+    - main
+```
+
+## Project Structure
+
+```
+db_migrate.py                    # All migration logic (single file)
+db/migrations/                   # SQL migration files
+  YYYYMMDDHHMMSS_description.sql
+tests/
+  conftest.py                    # Shared fixtures (tmp dirs)
+  test_db_migrate.py             # Unit tests (pure + mocked async)
+  test_e2e.py                    # E2E tests (testcontainers PostgreSQL)
+docker-compose.yml               # Standalone PostgreSQL for manual testing
+.github/workflows/test.yml       # CI: unit (3.12-3.14) + e2e + lint
+pyproject.toml                   # Dependencies and tool config
+.env.example                     # Environment variable template
+Makefile                         # Common commands
+```
+
+## Design Decisions
+
+- **Single file**: No package structure, copy into any project
+- **asyncpg**: Native PostgreSQL async driver, no ORM
+- **structlog**: JSON in production (piped stdout), human-readable in dev (TTY)
+- **Transactional**: Each migration is a single transaction (atomic apply/rollback)
+- **Schema support**: Tracking table can live in a dedicated PostgreSQL schema
+- **dbmate-compatible**: Same `-- migrate:up` / `-- migrate:down` marker format
+- **No framework coupling**: Works with FastAPI, Django, Flask, or standalone scripts
+- **MigrationError exceptions**: Library functions never call `sys.exit()`, enabling reuse as an imported module

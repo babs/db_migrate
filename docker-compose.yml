@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: migrate
+      POSTGRES_PASSWORD: migrate
+      POSTGRES_DB: migrate
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U migrate"]
+      interval: 2s
+      timeout: 5s
+      retries: 5

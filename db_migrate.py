@@ -53,7 +53,7 @@ import structlog
 
 # Lives in this file because it is vendored standalone. Stamped by the release
 # workflow; pyproject.toml mirrors it (enforced by a unit test).
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 
 log: structlog.stdlib.BoundLogger = structlog.get_logger()
 

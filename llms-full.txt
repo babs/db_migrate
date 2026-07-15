@@ -12,11 +12,16 @@ Designed to be dropped into any Python project that uses PostgreSQL.
 
 ```bash
 db_migrate.py                          # Apply all pending migrations
+db_migrate.py --dry-run                # Show what would be applied without executing
 db_migrate.py --status                 # Show migration status
-db_migrate.py --rollback               # Rollback last applied migration
+db_migrate.py --rollback [N]           # Rollback last N applied migrations (default 1)
+db_migrate.py --baseline               # Mark all migrations applied without running them
 db_migrate.py --create "description"   # Create new migration file
 db_migrate.py --verbose                # Enable debug logging
+db_migrate.py --version                # Print tool version
 ```
+
+`__version__` is embedded in `db_migrate.py` and stamped by the release workflow (manual dispatch with a version input; no hand-edited bumps). Each release publishes the file as a GitHub Release asset: `https://github.com/babs/db_migrate/releases/latest/download/db_migrate.py`
 
 ## Migration File Format
 
@@ -36,7 +41,8 @@ DROP TABLE users;
 
 - `-- migrate:up` block is executed when applying
 - `-- migrate:down` block is executed when rolling back
-- Each migration runs inside a single database transaction
+- Each migration runs inside a single database transaction by default
+- `-- migrate:up transaction:false` (dbmate-compatible) runs the block without a transaction wrapper — required for `CREATE INDEX CONCURRENTLY`. The version row is written only after the block succeeds; a partial failure leaves the migration pending.
 - Versions are tracked in `{SCHEMA_NAME}.schema_migrations` table
 
 ## Configuration
@@ -64,6 +70,10 @@ CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
 
 If `SCHEMA_NAME` is not `public`, the schema is created automatically.
 
+## Concurrency
+
+Every command takes a PostgreSQL advisory lock (`pg_advisory_lock`, fixed id `8675309`) for the duration of the run — all of them touch the tracking table (`CREATE TABLE IF NOT EXISTS`), so even `--status`/`--dry-run` serialize to avoid the concurrent-first-run DDL race. A second runner (e.g. a parallel Kubernetes Job) blocks until the first finishes instead of racing.
+
 ## Error Handling
 
 Library functions raise `MigrationError` on failure — they never call `sys.exit()` directly. Only the CLI entry points (`main()`/`async_main()`) catch `MigrationError` and translate it to exit codes.
@@ -85,7 +95,10 @@ Raises `MigrationError` if invalid.
 
 #### `parse_migration(content: str, direction: str = "up") -> str | None`
 Extract SQL block for the given direction (`up` or `down`) from migration file content.
-Returns `None` if the block is missing or empty.
+Returns `None` if the block is missing or empty. Marker options (e.g. `transaction:false`) are tolerated.
+
+#### `parse_transaction_option(content: str, direction: str = "up") -> bool`
+Return `False` if the block's marker carries `transaction:false`, else `True` (default).
 
 #### `discover_migrations(migrations_dir: Path) -> list[tuple[str, Path]]`
 Scan directory for `.sql` files matching `YYYYMMDDHHMMSS_*.sql`.
@@ -111,16 +124,22 @@ Raises `MigrationError` if schema name is invalid.
 Return set of version strings that have been applied.
 Raises `MigrationError` if schema name is invalid.
 
-#### `run_migrate(conn, schema: str, migrations_dir: Path) -> int`
-Apply all pending migrations in order. Returns count of migrations applied.
+#### `run_migrate(conn, schema: str, migrations_dir: Path, dry_run: bool = False) -> int`
+Apply all pending migrations in order. Returns count of migrations applied (or that would be applied when `dry_run=True`; dry-run executes nothing).
 Raises `MigrationError` if a migration file is missing the `-- migrate:up` block.
 
-#### `run_rollback(conn, schema: str, migrations_dir: Path) -> bool`
-Rollback the most recently applied migration. Returns `True` on success, `False` if nothing to rollback.
-Raises `MigrationError` if migration file is missing or has no `-- migrate:down` block.
+#### `run_rollback(conn, schema: str, migrations_dir: Path, count: int = 1) -> int`
+Rollback the last `count` applied migrations, newest first. Returns number rolled back (0 if nothing applied).
+Raises `MigrationError` if `count < 1`, a migration file is missing, or has no `-- migrate:down` block.
+
+#### `run_baseline(conn, schema: str, migrations_dir: Path) -> int`
+Mark all pending migrations as applied without executing their SQL. Returns count baselined. Use when adopting an existing database whose schema already matches the migrations.
 
 #### `run_status(conn, schema: str, migrations_dir: Path) -> None`
 Print a table showing `[applied]` or `[pending]` for each migration file.
+
+#### `acquire_lock(conn) -> None` / `release_lock(conn) -> None`
+Take/release the advisory lock (`ADVISORY_LOCK_ID = 8675309`) that serializes concurrent runners. The CLI wraps every command with these automatically.
 
 ## Dependencies
 
@@ -211,6 +230,7 @@ tests/
   test_e2e.py                    # E2E tests (testcontainers PostgreSQL)
 docker-compose.yml               # Standalone PostgreSQL for manual testing
 .github/workflows/test.yml       # CI: unit (3.12-3.14) + e2e + lint
+.github/workflows/release.yml    # Release: stamp version, test, tag, publish (manual dispatch)
 pyproject.toml                   # Dependencies and tool config
 .env.example                     # Environment variable template
 Makefile                         # Common commands

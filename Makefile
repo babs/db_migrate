@@ -1,4 +1,4 @@
-.PHONY: install lint test test-unit test-e2e migrate status rollback clean
+.PHONY: install lint test test-unit test-e2e migrate dry-run status rollback baseline clean
 
 install:
 	uv sync
@@ -18,11 +18,17 @@ test-e2e:
 migrate:
 	uv run python db_migrate.py
 
+dry-run:
+	uv run python db_migrate.py --dry-run
+
 status:
 	uv run python db_migrate.py --status
 
 rollback:
 	uv run python db_migrate.py --rollback
+
+baseline:
+	uv run python db_migrate.py --baseline
 
 clean:
 	rm -rf __pycache__ .mypy_cache .pytest_cache .ruff_cache .coverage htmlcov

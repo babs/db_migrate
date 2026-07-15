@@ -4,14 +4,17 @@
 
 ## What it does
 
-Manages PostgreSQL schema migrations using plain SQL files with `-- migrate:up` and `-- migrate:down` markers. Tracks applied versions in a `schema_migrations` table. Each migration runs in a transaction.
+Manages PostgreSQL schema migrations using plain SQL files with `-- migrate:up` and `-- migrate:down` markers. Tracks applied versions in a `schema_migrations` table. Each migration runs in a transaction by default. Concurrent runners are serialized via a PostgreSQL advisory lock.
 
 ## Commands
 
 - `db_migrate.py` — apply all pending migrations
+- `db_migrate.py --dry-run` — show pending migrations without applying them
 - `db_migrate.py --status` — show migration status
-- `db_migrate.py --rollback` — rollback last migration
+- `db_migrate.py --rollback [N]` — rollback last N migrations (default: 1)
+- `db_migrate.py --baseline` — mark all migrations applied without running them
 - `db_migrate.py --create "description"` — create new migration file
+- `db_migrate.py --version` — print tool version (embedded `__version__`)
 
 ## Migration file format
 
@@ -24,6 +27,8 @@ CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
 -- migrate:down
 DROP TABLE users;
 ```
+
+Blocks run in a transaction by default. Disable per block with `-- migrate:up transaction:false` (dbmate-compatible; needed for `CREATE INDEX CONCURRENTLY`). A `transaction:false` block must contain a single statement — multi-statement strings execute in an implicit transaction.
 
 ## Configuration (env vars)
 

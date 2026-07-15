@@ -12,8 +12,12 @@ import pytest
 from testcontainers.postgres import PostgresContainer
 
 from db_migrate import (
+    ADVISORY_LOCK_ID,
     MigrationError,
+    acquire_lock,
     get_applied_versions,
+    release_lock,
+    run_baseline,
     run_migrate,
     run_rollback,
     run_status,
@@ -87,7 +91,7 @@ class TestMigrateE2E:
 
     async def test_rollback_latest(self, conn: asyncpg.Connection, migrations_dir: Path) -> None:
         result = await run_rollback(conn, SCHEMA, migrations_dir)
-        assert result is True
+        assert result == 1
 
         applied = await get_applied_versions(conn, SCHEMA)
         assert applied == {"20260101000000"}
@@ -100,7 +104,7 @@ class TestMigrateE2E:
 
     async def test_rollback_again(self, conn: asyncpg.Connection, migrations_dir: Path) -> None:
         result = await run_rollback(conn, SCHEMA, migrations_dir)
-        assert result is True
+        assert result == 1
 
         applied = await get_applied_versions(conn, SCHEMA)
         assert applied == set()
@@ -113,7 +117,7 @@ class TestMigrateE2E:
 
     async def test_rollback_empty_is_noop(self, conn: asyncpg.Connection, migrations_dir: Path) -> None:
         result = await run_rollback(conn, SCHEMA, migrations_dir)
-        assert result is False
+        assert result == 0
 
     async def test_reapply_after_full_rollback(self, conn: asyncpg.Connection, migrations_dir: Path) -> None:
         count = await run_migrate(conn, SCHEMA, migrations_dir)
@@ -163,8 +167,128 @@ class TestCustomSchemaE2E:
         assert row is not None
 
         result = await run_rollback(conn, schema, schema_migrations_dir)
-        assert result is True
+        assert result == 1
 
     async def test_invalid_schema_rejected(self, conn: asyncpg.Connection, migrations_dir: Path) -> None:
         with pytest.raises(MigrationError, match="invalid schema name"):
             await run_migrate(conn, "bad;schema", migrations_dir)
+
+
+class TestDryRunE2E:
+    async def test_dry_run_reports_without_applying(self, conn: asyncpg.Connection, tmp_path: Path) -> None:
+        d = tmp_path / "dryrun_migrations"
+        d.mkdir()
+        # Version chosen to not collide with other suites sharing the module-scoped container
+        (d / "20990201000000_create_dryrun.sql").write_text(
+            "-- migrate:up\nCREATE TABLE dryrun_t (id INT);\n\n-- migrate:down\nDROP TABLE dryrun_t;\n"
+        )
+
+        count = await run_migrate(conn, SCHEMA, d, dry_run=True)
+        assert count == 1
+
+        tables = await conn.fetch(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'dryrun_t'"
+        )
+        assert len(tables) == 0
+
+        applied = await get_applied_versions(conn, SCHEMA)
+        assert "20990201000000" not in applied
+
+
+class TestBaselineE2E:
+    async def test_baseline_marks_without_executing(self, conn: asyncpg.Connection, tmp_path: Path) -> None:
+        d = tmp_path / "baseline_migrations"
+        d.mkdir()
+        (d / "20990101000000_create_baseline.sql").write_text(
+            "-- migrate:up\nCREATE TABLE baseline_t (id INT);\n\n-- migrate:down\nDROP TABLE baseline_t;\n"
+        )
+
+        count = await run_baseline(conn, SCHEMA, d)
+        assert count == 1
+
+        tables = await conn.fetch(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'baseline_t'"
+        )
+        assert len(tables) == 0
+
+        applied = await get_applied_versions(conn, SCHEMA)
+        assert "20990101000000" in applied
+
+        # Baselined version is no longer pending
+        count = await run_migrate(conn, SCHEMA, d)
+        assert count == 0
+
+
+class TestNoTransactionE2E:
+    async def test_create_index_concurrently(self, conn: asyncpg.Connection, tmp_path: Path) -> None:
+        d = tmp_path / "notx_migrations"
+        d.mkdir()
+        (d / "20990301000000_create_notx.sql").write_text(
+            "-- migrate:up\nCREATE TABLE notx_t (id INT);\n\n-- migrate:down\nDROP TABLE notx_t;\n"
+        )
+        # CREATE INDEX CONCURRENTLY cannot run inside a transaction block —
+        # this fails unless transaction:false is honored.
+        (d / "20990302000000_add_index.sql").write_text(
+            "-- migrate:up transaction:false\n"
+            "CREATE INDEX CONCURRENTLY notx_idx ON notx_t (id);\n\n"
+            "-- migrate:down transaction:false\n"
+            "DROP INDEX CONCURRENTLY notx_idx;\n"
+        )
+
+        count = await run_migrate(conn, SCHEMA, d)
+        assert count == 2
+
+        row = await conn.fetchrow("SELECT 1 FROM pg_indexes WHERE indexname = 'notx_idx'")
+        assert row is not None
+
+        result = await run_rollback(conn, SCHEMA, d, count=2)
+        assert result == 2
+
+        row = await conn.fetchrow("SELECT 1 FROM pg_indexes WHERE indexname = 'notx_idx'")
+        assert row is None
+
+    async def test_multi_statement_block_raises_clear_error(
+        self, conn: asyncpg.Connection, tmp_path: Path
+    ) -> None:
+        """asyncpg runs multi-statement strings in an implicit transaction — the tool must
+        surface that as a MigrationError with a hint, not a raw driver exception."""
+        d = tmp_path / "multistmt_migrations"
+        d.mkdir()
+        (d / "20990401000000_t.sql").write_text(
+            "-- migrate:up\nCREATE TABLE msf_t (id INT);\n\n-- migrate:down\nDROP TABLE msf_t;\n"
+        )
+        (d / "20990402000000_bad.sql").write_text(
+            "-- migrate:up transaction:false\n"
+            "SET statement_timeout = 0;\n"
+            "CREATE INDEX CONCURRENTLY msf_idx ON msf_t (id);\n\n"
+            "-- migrate:down\nDROP INDEX msf_idx;\n"
+        )
+
+        with pytest.raises(MigrationError, match="single statement"):
+            await run_migrate(conn, SCHEMA, d)
+
+        # First migration applied, failing one left pending — consistent state
+        applied = await get_applied_versions(conn, SCHEMA)
+        assert "20990401000000" in applied
+        assert "20990402000000" not in applied
+
+        # Targeted cleanup — order-independent, unlike run_rollback which pops the
+        # global max version of the shared container
+        await conn.execute("DROP TABLE msf_t")
+        await conn.execute("DELETE FROM schema_migrations WHERE version = $1", "20990401000000")
+
+
+class TestAdvisoryLockE2E:
+    async def test_lock_blocks_second_session(
+        self, postgres_container: PostgresContainer, conn: asyncpg.Connection
+    ) -> None:
+        await acquire_lock(conn)
+        try:
+            other = await asyncpg.connect(postgres_container.get_connection_url())
+            try:
+                got_it = await other.fetchval("SELECT pg_try_advisory_lock($1)", ADVISORY_LOCK_ID)
+                assert got_it is False
+            finally:
+                await other.close()
+        finally:
+            await release_lock(conn)
